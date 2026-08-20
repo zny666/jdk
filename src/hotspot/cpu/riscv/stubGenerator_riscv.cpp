@@ -7424,6 +7424,561 @@ class StubGenerator: public StubCodeGenerator {
     return start;
   }
 
+  // Keccak round constants (24 values for 24 rounds of Keccak-f[1600])
+  alignas(64) static constexpr uint64_t keccak_round_constants[24] = {
+    0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808AULL,
+    0x8000000080008000ULL, 0x000000000000808BULL, 0x0000000080000001ULL,
+    0x8000000080008081ULL, 0x8000000000008009ULL, 0x000000000000008AULL,
+    0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000AULL,
+    0x000000008000808BULL, 0x800000000000008BULL, 0x8000000000008089ULL,
+    0x8000000000008003ULL, 0x8000000000008002ULL, 0x8000000000000080ULL,
+    0x000000000000800AULL, 0x800000008000000AULL, 0x8000000080008081ULL,
+    0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL
+  };
+
+  // ========================================================================
+  // SHA-3 (Keccak-f[1600]) GPR (scalar) implementation
+  //
+  // Ported from AArch64 GPR implementation (stubGenerator_aarch64.cpp).
+  // Uses scalar RISC-V instructions: xorr, andn (Zbb), rori (Zbb).
+  //
+  // Register allocation: 25 state lanes + 2 temps = 27 GPRs, defined by
+  // struct Sha3GprRegs below. lane23/lane24 (ra/fp) are saved by enter();
+  // tmp0/tmp1 reuse the c_rarg2/c_rarg0 argument registers after the
+  // arguments are saved on the stack.
+  // x27/xheapbase is NOT used (would cause compressed oops corruption).
+  //
+  // Round constant pointer is kept on stack (no spare GPR).
+  // Requires: Zbb (for andn and rori).
+  // ========================================================================
+
+  // Rate (block size) of each SHA3/SHAKE variant, in bytes:
+  // SHA3-512=72 SHA3-384=104 SHA3-256=136 SHA3-224=144 SHAKE128=168.
+  // Bit patterns used by the absorb dispatch below:
+  // 72=0x48 104=0x68 136=0x88 144=0x90 168=0xa8.
+  static const int SHA3_512_BLOCK_SIZE  =  72;
+  static const int SHA3_384_BLOCK_SIZE  = 104;
+  static const int SHA3_256_BLOCK_SIZE  = 136;
+  static const int SHA3_224_BLOCK_SIZE  = 144;
+  static const int SHAKE128_BLOCK_SIZE  = 168;
+
+  // Rate dispatch masks (rates in hex: 72=0x48 104=0x68 136=0x88 144=0x90 168=0xa8).
+  // Bit 7 separates the 72/104 pair from 136/144/168; bits 4-5 resolve the
+  // rest; bit 5 alone splits 72 vs 104 and 136 vs 168.
+  static const int SHA3_RATE_GT_104_MASK = 0x80;
+  static const int SHA3_RATE_MOD32_MASK  = 0x30;
+  static const int SHA3_RATE_BIT5_MASK   = 0x20;
+
+  // Stack frame layout (SHA3_GPR_FRAME bytes below the enter() frame):
+  //   [0,80) callee-saved x9, x18-x26   [80,96) theta spills (lane4/lane9)
+  //   [96,104) chi tmp   [104,128) state/ofs/limit   [128,160) bs/buf/rc cursors
+  static const int SHA3_GPR_FRAME = 160;
+  static const int SHA3_CALLEE_SAVED_COUNT = 10;
+  static const int SHA3_SAVE_X9    =   0;  // x9, x18-x26 at +8 each
+  static const int SHA3_LANE4_SPILL   =  80;
+  static const int SHA3_LANE9_SPILL   =  88;
+  static const int SHA3_CHI_TMP    =  96;
+  static const int SHA3_STATE      = 104;
+  static const int SHA3_OFS        = 112;
+  static const int SHA3_LIMIT      = 120;
+  static const int SHA3_BS         = 128;
+  static const int SHA3_BUF        = 136;
+  static const int SHA3_RC_PTR     = 144;
+  static const int SHA3_END_PTR    = 152;
+
+  // GPR register set used by all SHA3 GPR stubs.
+  // 25 state lanes + 2 temporaries = 27 GPRs (x27/xheapbase excluded).
+  struct Sha3GprRegs {
+    Register lane0 = x5,   lane1 = x6,   lane2 = x7,   lane3 = x9,   lane4 = x13;
+    Register lane5 = x14,  lane6 = x15,  lane7 = x16,  lane8 = x17,  lane9 = x18;
+    Register lane10 = x19, lane11 = x20, lane12 = x21, lane13 = x22, lane14 = x23;
+    Register lane15 = x24, lane16 = x25, lane17 = x26, lane18 = x11, lane19 = x28;
+    Register lane20 = x29, lane21 = x30, lane22 = x31, lane23 = ra,  lane24 = fp;
+    Register tmp0 = x12, tmp1 = x10;
+  };
+
+  static constexpr Register sha3_callee_saved[SHA3_CALLEE_SAVED_COUNT] =
+      {x9, x18, x19, x20, x21, x22, x23, x24, x25, x26};
+
+  void sha3_gpr_save_callee_saved() {
+    for (int i = 0; i < SHA3_CALLEE_SAVED_COUNT; i++) {
+      __ sd(sha3_callee_saved[i], Address(sp, SHA3_SAVE_X9 + i * 8));
+    }
+  }
+
+  void sha3_gpr_restore_callee_saved() {
+    for (int i = 0; i < SHA3_CALLEE_SAVED_COUNT; i++) {
+      __ ld(sha3_callee_saved[i], Address(sp, SHA3_SAVE_X9 + i * 8));
+    }
+  }
+
+  void sha3_gpr_load_state(Register base, const Sha3GprRegs& r) {
+    const Register lanes[24] = {
+      r.lane0,  r.lane1,  r.lane2,  r.lane3,  r.lane4,  r.lane5,  r.lane6,  r.lane7,
+      r.lane8,  r.lane9,  r.lane10, r.lane11, r.lane12, r.lane13, r.lane14, r.lane15,
+      r.lane16, r.lane17, r.lane19, r.lane20, r.lane21, r.lane22, r.lane23, r.lane24
+    };
+    for (int i = 0; i < 24; i++) {
+      __ ld(lanes[i], Address(base, i < 18 ? i * 8 : (i + 1) * 8));
+    }
+    // lane18 (x11) loaded last - x11 aliases base (state=c_rarg1=x11)
+    __ ld(r.lane18, Address(base, 18 * 8));
+  }
+
+  void sha3_gpr_store_state(Register base, const Sha3GprRegs& r) {
+    const Register lanes[24] = {
+      r.lane0,  r.lane1,  r.lane2,  r.lane3,  r.lane4,  r.lane5,  r.lane6,  r.lane7,
+      r.lane8,  r.lane9,  r.lane10, r.lane11, r.lane12, r.lane13, r.lane14, r.lane15,
+      r.lane16, r.lane17, r.lane19, r.lane20, r.lane21, r.lane22, r.lane23, r.lane24
+    };
+    for (int i = 0; i < 24; i++) {
+      __ sd(lanes[i], Address(base, i < 18 ? i * 8 : (i + 1) * 8));
+    }
+    // lane18 (x11) is stored last so that base may alias lane18 without
+    // being clobbered before the final store. Caller invariant: the lane18
+    // register must still hold its lane value here - never load the state
+    // pointer into x11 before calling (that corrupts state[18]).
+    __ sd(r.lane18, Address(base, 18 * 8));
+  }
+
+  void sha3_gpr_init_rc(Register tmp) {
+    __ la(tmp, ExternalAddress((address)keccak_round_constants));
+    __ sd(tmp, Address(sp, SHA3_RC_PTR));
+    __ addi(tmp, tmp, 24 * 8);
+    __ sd(tmp, Address(sp, SHA3_END_PTR));
+  }
+
+  // One full Keccak-f[1600] permutation on the state whose pointer is
+  // held in stack slot state_slot. The pointer is always loaded into
+  // tmp0 (x12), which is not a lane, so it can never corrupt lane18.
+  void sha3_gpr_permute(int state_slot, const Sha3GprRegs& r, Label& loop) {
+    __ ld(r.tmp0, Address(sp, state_slot));
+    sha3_gpr_load_state(r.tmp0, r);
+    sha3_gpr_init_rc(r.tmp0);
+    __ BIND(loop);
+    keccak_round_gpr(r, loop);
+    __ ld(r.tmp0, Address(sp, state_slot));
+    sha3_gpr_store_state(r.tmp0, r);
+  }
+
+  // Absorb one lane: lane ^= *(buf + offset)
+  void sha3_gpr_xor_lane(Register buf, int offset, Register lane, Register tmp) {
+    __ ld(tmp, Address(buf, offset));
+    __ xorr(lane, lane, tmp);
+  }
+
+  // Epilogue: restore fp, callee-saved, leave, ret
+  // (leave() recomputes sp from fp, no explicit frame pop needed)
+  void sha3_gpr_epilogue() {
+    // +16 skips the SHA3_GPR_FRAME locals plus the ra/fp pair saved by
+    // enter(), pointing fp at the frame leave() expects.
+    __ addi(fp, sp, SHA3_GPR_FRAME + 16);
+    sha3_gpr_restore_callee_saved();
+    __ leave();
+    __ ret();
+  }
+
+  void bcax5_gpr(Register lane0, Register lane1, Register lane2, Register lane3, Register lane4,
+                 Register tmp0, Register tmp1) {
+    // a'[i] = a[i] ^ (~a[i+1] & a[i+2])
+    // With 2 temps: spill tmp0 (~lane1&lane2) to stack, reuse for ~lane3&lane4
+    __ andn(tmp0, lane2, lane1);            // tmp0 = ~lane1 & lane2
+    __ sd(tmp0, Address(sp, SHA3_CHI_TMP));
+    __ andn(tmp1, lane3, lane2);            // tmp1 = ~lane2 & lane3
+    __ andn(tmp0, lane4, lane3);            // tmp0 = ~lane3 & lane4 (reused)
+    __ xorr(lane2, lane2, tmp0);            // lane2 ^= (~lane3 & lane4)
+    __ andn(tmp0, lane0, lane4);            // tmp0 = ~lane4 & lane0
+    __ xorr(lane3, lane3, tmp0);            // lane3 ^= (~lane4 & lane0)
+    __ andn(tmp0, lane1, lane0);            // tmp0 = ~lane0 & lane1
+    __ xorr(lane4, lane4, tmp0);            // lane4 ^= (~lane0 & lane1)
+    __ ld(tmp0, Address(sp, SHA3_CHI_TMP)); // restore ~lane1 & lane2
+    __ xorr(lane0, lane0, tmp0);            // lane0 ^= (~lane1 & lane2)
+    __ xorr(lane1, lane1, tmp1);            // lane1 ^= (~lane2 & lane3)
+  }
+
+  // Theta step of Keccak-f[1600] with only 2 spare GPRs.
+  //
+  // With just tmp0/tmp1 available, lane4 and lane9 are spilled to
+  // SHA3_LANE4_SPILL/SHA3_LANE9_SPILL and reused as extra temporaries (aliased
+  // below as tmp3/tmp4); they are restored before leaving.
+  // c1 needs to survive until d2 is derived, so it is parked in
+  // SHA3_CHI_TMP (chi overwrites the same slot later in the round,
+  // after theta is done with it).
+  //
+  // Ordering constraints (do not reorder across them):
+  //   - each column parity c[i] must be computed BEFORE the d value
+  //     derived from the *previous* column is XORed into that column
+  //     (c0 before d0 is applied, c3 before d3 is applied);
+  //   - c4 is carried in tmp0 until c3 replaces it.
+  void sha3_gpr_theta(const Sha3GprRegs& r) {
+    Register lane0=r.lane0,  lane1=r.lane1,  lane2=r.lane2,  lane3=r.lane3,  lane4=r.lane4,
+             lane5=r.lane5,  lane6=r.lane6,  lane7=r.lane7,  lane8=r.lane8,  lane9=r.lane9,
+             lane10=r.lane10, lane11=r.lane11, lane12=r.lane12, lane13=r.lane13, lane14=r.lane14,
+             lane15=r.lane15, lane16=r.lane16, lane17=r.lane17, lane18=r.lane18, lane19=r.lane19,
+             lane20=r.lane20, lane21=r.lane21, lane22=r.lane22, lane23=r.lane23, lane24=r.lane24;
+    Register tmp0=r.tmp0, tmp1=r.tmp1;
+
+    // c4 = lane4^lane9^lane14^lane19^lane24
+    __ xorr(tmp1, lane4, lane9);
+    __ xorr(tmp1, tmp1, lane14);
+    __ xorr(tmp0, tmp1, lane19);
+    __ xorr(tmp0, tmp0, lane24);          // tmp0 = c4
+    // c1 = lane1^lane6^lane11^lane16^lane21
+    __ xorr(tmp1, lane1, lane6);
+    __ xorr(tmp1, tmp1, lane11);
+    __ xorr(tmp1, tmp1, lane16);
+    __ xorr(tmp1, tmp1, lane21);          // tmp1 = c1
+    // spill c1, compute d0
+    __ sd(tmp1, Address(sp, SHA3_CHI_TMP));
+    __ rori(tmp1, tmp1, 63);
+    __ xorr(tmp1, tmp0, tmp1);          // tmp1 = d0
+
+    {
+      __ sd(lane4, Address(sp, SHA3_LANE4_SPILL));
+      __ sd(lane9, Address(sp, SHA3_LANE9_SPILL));
+      Register tmp3 = lane4, tmp4 = lane9;
+
+      // c0 = lane0^lane5^lane10^lane15^lane20 - BEFORE d0 applied
+      __ xorr(tmp3, lane0, lane5);
+      __ xorr(tmp3, tmp3, lane10);
+      __ xorr(tmp4, tmp3, lane15);
+      __ xorr(tmp4, tmp4, lane20);        // tmp4 = c0
+
+      // apply d0 (tmp1) - AFTER c0
+      __ xorr(lane0, lane0, tmp1);
+      __ xorr(lane5, lane5, tmp1);
+      __ xorr(lane10, lane10, tmp1);
+      __ xorr(lane15, lane15, tmp1);
+      __ xorr(lane20, lane20, tmp1);
+
+      // c2 = lane2^lane7^lane12^lane17^lane22
+      __ xorr(tmp3, lane2, lane7);
+      __ xorr(tmp3, tmp3, lane12);
+      __ xorr(tmp1, tmp3, lane17);
+      __ xorr(tmp1, tmp1, lane22);        // tmp1 = c2
+
+      // d1 = c0 ^ ror(c2,63)
+      __ rori(tmp3, tmp1, 63);
+      __ xorr(tmp3, tmp4, tmp3);       // tmp3 = d1
+      __ xorr(lane1, lane1, tmp3);
+      __ xorr(lane6, lane6, tmp3);
+      __ xorr(lane11, lane11, tmp3);
+      __ xorr(lane16, lane16, tmp3);
+      __ xorr(lane21, lane21, tmp3);
+
+      // d3 = c2 ^ ror(c4,63)
+      __ rori(tmp3, tmp0, 63);
+      __ xorr(tmp3, tmp1, tmp3);      // tmp3 = d3
+
+      // c3 = lane3^lane8^lane13^lane18^lane23 - BEFORE d3 applied
+      __ xorr(tmp1, lane3, lane8);
+      __ xorr(tmp1, tmp1, lane13);
+      __ xorr(tmp0, tmp1, lane18);        // c4 no longer needed
+      __ xorr(tmp0, tmp0, lane23);        // tmp0 = c3
+
+      // apply d3 (tmp3) - AFTER c3
+      __ xorr(lane3, lane3, tmp3);
+      __ xorr(lane8, lane8, tmp3);
+      __ xorr(lane13, lane13, tmp3);
+      __ xorr(lane18, lane18, tmp3);
+      __ xorr(lane23, lane23, tmp3);
+
+      // d2 = c1 ^ ror(c3,63) - reload c1
+      __ rori(tmp3, tmp0, 63);
+      __ ld(tmp1, Address(sp, SHA3_CHI_TMP));
+      __ xorr(tmp1, tmp1, tmp3);       // tmp1 = d2
+      __ xorr(lane2, lane2, tmp1);
+      __ xorr(lane7, lane7, tmp1);
+      __ xorr(lane12, lane12, tmp1);
+
+      // d4 = c3 ^ ror(c0,63)
+      __ rori(tmp3, tmp4, 63);
+      __ xorr(tmp0, tmp0, tmp3);       // tmp0 = d4
+
+      __ ld(lane4, Address(sp, SHA3_LANE4_SPILL));
+      __ ld(lane9, Address(sp, SHA3_LANE9_SPILL));
+
+      __ xorr(lane17, lane17, tmp1);
+      __ xorr(lane22, lane22, tmp1);
+      __ xorr(lane4, lane4, tmp0);
+      __ xorr(lane9, lane9, tmp0);
+      __ xorr(lane14, lane14, tmp0);
+      __ xorr(lane19, lane19, tmp0);
+      __ xorr(lane24, lane24, tmp0);
+    }
+  }
+
+  void keccak_round_gpr(const Sha3GprRegs& r, Label& loop_body) {
+    Register lane0=r.lane0,  lane1=r.lane1,  lane2=r.lane2,  lane3=r.lane3,  lane4=r.lane4,
+             lane5=r.lane5,  lane6=r.lane6,  lane7=r.lane7,  lane8=r.lane8,  lane9=r.lane9,
+             lane10=r.lane10, lane11=r.lane11, lane12=r.lane12, lane13=r.lane13, lane14=r.lane14,
+             lane15=r.lane15, lane16=r.lane16, lane17=r.lane17, lane18=r.lane18, lane19=r.lane19,
+             lane20=r.lane20, lane21=r.lane21, lane22=r.lane22, lane23=r.lane23, lane24=r.lane24;
+    Register tmp0=r.tmp0, tmp1=r.tmp1;
+
+    sha3_gpr_theta(r);
+
+    // ===== Rho + Pi (fused: rotate + lane reassignment) =====
+    __ rori(tmp0, lane10, 61);
+    __ rori(lane10, lane1,  63);
+    __ rori(lane1,  lane6,  20);
+    __ rori(lane6,  lane9,  44);
+    __ rori(lane9,  lane22,  3);
+    __ rori(lane22, lane14, 25);
+    __ rori(lane14, lane20, 46);
+    __ rori(lane20, lane2,   2);
+    __ rori(lane2,  lane12, 21);
+    __ rori(lane12, lane13, 39);
+    __ rori(lane13, lane19, 56);
+    __ rori(lane19, lane23,  8);
+    __ rori(lane23, lane15, 23);
+    __ rori(lane15, lane4,  37);
+    __ rori(lane4,  lane24, 50);
+    __ rori(lane24, lane21, 62);
+    __ rori(lane21, lane8,   9);
+    __ rori(lane8,  lane16, 19);
+    __ rori(lane16, lane5,  28);
+    __ rori(lane5,  lane3,  36);
+    __ rori(lane3,  lane18, 43);
+    __ rori(lane18, lane17, 49);
+    __ rori(lane17, lane11, 54);
+    __ rori(lane11, lane7,  58);
+    __ mv(lane7, tmp0);
+
+    // ===== Chi =====
+    bcax5_gpr(lane0, lane1, lane2, lane3, lane4, tmp0, tmp1);
+    bcax5_gpr(lane5, lane6, lane7, lane8, lane9, tmp0, tmp1);
+    bcax5_gpr(lane10, lane11, lane12, lane13, lane14, tmp0, tmp1);
+    bcax5_gpr(lane15, lane16, lane17, lane18, lane19, tmp0, tmp1);
+    bcax5_gpr(lane20, lane21, lane22, lane23, lane24, tmp0, tmp1);
+
+    // ===== Iota =====
+    __ ld(tmp0, Address(sp, SHA3_RC_PTR));
+    __ ld(tmp1, Address(tmp0, 0));
+    __ addi(tmp0, tmp0, 8);
+    __ sd(tmp0, Address(sp, SHA3_RC_PTR));
+    __ xorr(lane0, lane0, tmp1);
+    // Loop: tmp0 = advanced rc_ptr, reload end_ptr via tmp1
+    __ ld(tmp1, Address(sp, SHA3_END_PTR));
+    __ bne(tmp0, tmp1, loop_body);
+  }
+
+  address generate_sha3_implCompress_gpr(StubId stub_id) {
+    bool multi_block;
+    switch (stub_id) {
+    case StubId::stubgen_sha3_implCompress_id:
+      multi_block = false; break;
+    case StubId::stubgen_sha3_implCompressMB_id:
+      multi_block = true; break;
+    default:
+      ShouldNotReachHere();
+    }
+
+    int entry_count = StubInfo::entry_count(stub_id);
+    assert(entry_count == 1, "sanity check");
+    address start = load_archive_data(stub_id);
+    if (start != nullptr) {
+      return start;
+    }
+    __ align(CodeEntryAlignment);
+    StubCodeMark mark(this, stub_id);
+    start = __ pc();
+    BLOCK_COMMENT("sha3_implCompress_gpr {");
+
+    Register buf        = c_rarg0;
+    Register state      = c_rarg1;
+    Register block_size = c_rarg2;
+    Register ofs        = c_rarg3;
+    Register limit      = c_rarg4;
+
+    Sha3GprRegs r;
+    // Only the lanes touched by absorb need local names; the rest are
+    // passed to keccak_round_gpr() via the Sha3GprRegs struct.
+    Register lane0 = r.lane0,  lane1 = r.lane1,  lane2 = r.lane2,  lane3 = r.lane3;
+    Register lane4 = r.lane4,  lane5 = r.lane5,  lane6 = r.lane6,  lane7 = r.lane7;
+    Register lane8 = r.lane8,  lane9 = r.lane9,  lane10 = r.lane10, lane11 = r.lane11;
+    Register lane12 = r.lane12, lane13 = r.lane13, lane14 = r.lane14, lane15 = r.lane15;
+    Register lane16 = r.lane16, lane17 = r.lane17, lane18 = r.lane18, lane19 = r.lane19;
+    Register lane20 = r.lane20;
+    Register tmp0=r.tmp0, tmp1=r.tmp1;
+
+    Label sha3_loop, rounds24_preloop, loop_body;
+    Label sha3_512_or_384, shake128;
+
+    __ enter();
+    __ subi(sp, sp, SHA3_GPR_FRAME);
+
+    sha3_gpr_save_callee_saved();
+
+    // Save input args needed later
+    __ sd(block_size, Address(sp, SHA3_BS));
+    __ sd(state, Address(sp, SHA3_STATE));
+    if (multi_block) {
+      __ sd(ofs, Address(sp, SHA3_OFS));
+      __ sd(limit, Address(sp, SHA3_LIMIT));
+    }
+
+    // Load 25 state lanes
+    sha3_gpr_load_state(state, r);
+
+    __ BIND(sha3_loop);
+
+    // Absorb input: XOR buf bytes into state lanes.
+    // Always absorb lane0-lane6 (56 bytes).
+    sha3_gpr_xor_lane(buf, 0,  lane0,  tmp0);
+    sha3_gpr_xor_lane(buf, 8,  lane1,  tmp0);
+    sha3_gpr_xor_lane(buf, 16, lane2,  tmp0);
+    sha3_gpr_xor_lane(buf, 24, lane3,  tmp0);
+    sha3_gpr_xor_lane(buf, 32, lane4,  tmp0);
+    sha3_gpr_xor_lane(buf, 40, lane5,  tmp0);
+    sha3_gpr_xor_lane(buf, 48, lane6,  tmp0);
+
+    // Reload block_size into tmp0 (was clobbered by absorb above)
+    __ ld(tmp0, Address(sp, SHA3_BS));
+
+    // bit7: 72/104 (0) vs 136/144/168 (1)
+    __ andi(tmp0, tmp0, SHA3_RATE_GT_104_MASK);
+    __ beqz(tmp0, sha3_512_or_384);
+
+    // 136/144/168: absorb lane7-lane16 (80 bytes)
+    sha3_gpr_xor_lane(buf, 56,  lane7,  tmp0);
+    sha3_gpr_xor_lane(buf, 64,  lane8,  tmp0);
+    sha3_gpr_xor_lane(buf, 72,  lane9,  tmp0);
+    sha3_gpr_xor_lane(buf, 80,  lane10, tmp0);
+    sha3_gpr_xor_lane(buf, 88,  lane11, tmp0);
+    sha3_gpr_xor_lane(buf, 96,  lane12, tmp0);
+    sha3_gpr_xor_lane(buf, 104, lane13, tmp0);
+    sha3_gpr_xor_lane(buf, 112, lane14, tmp0);
+    sha3_gpr_xor_lane(buf, 120, lane15, tmp0);
+    sha3_gpr_xor_lane(buf, 128, lane16, tmp0);
+    __ addi(buf, buf, SHA3_256_BLOCK_SIZE);
+
+    // bits 4,5: reload block_size (tmp0 was clobbered by absorb above)
+    __ ld(tmp0, Address(sp, SHA3_BS));
+    __ andi(tmp0, tmp0, SHA3_RATE_MOD32_MASK);
+    __ beqz(tmp0, rounds24_preloop);    // 136: SHA3-256/SHAKE256
+    // tmp0 still holds block_size & SHA3_RATE_MOD32_MASK - no reload needed
+    __ andi(tmp0, tmp0, SHA3_RATE_BIT5_MASK);
+    __ bnez(tmp0, shake128);            // 168: SHAKE128
+    // 144: SHA3-224 - absorb lane17 (+8 over the 136 prefix)
+    sha3_gpr_xor_lane(buf, 0, lane17, tmp0);
+    __ addi(buf, buf, SHA3_224_BLOCK_SIZE - SHA3_256_BLOCK_SIZE);
+    __ j(rounds24_preloop);
+
+    __ BIND(shake128);
+    // 168: absorb lane17-lane20 (+32 over the 136 prefix)
+    sha3_gpr_xor_lane(buf, 0,  lane17, tmp0);
+    sha3_gpr_xor_lane(buf, 8,  lane18, tmp0);
+    sha3_gpr_xor_lane(buf, 16, lane19, tmp0);
+    sha3_gpr_xor_lane(buf, 24, lane20, tmp0);
+    __ addi(buf, buf, SHAKE128_BLOCK_SIZE - SHA3_256_BLOCK_SIZE);
+    __ j(rounds24_preloop);
+
+    __ BIND(sha3_512_or_384);
+    // 72: absorb lane7-lane8; 104: absorb lane7-lane12
+    sha3_gpr_xor_lane(buf, 56, lane7, tmp0);
+    sha3_gpr_xor_lane(buf, 64, lane8, tmp0);
+    __ addi(buf, buf, SHA3_512_BLOCK_SIZE);
+    // reload block_size (tmp0 was clobbered by absorb above)
+    __ ld(tmp0, Address(sp, SHA3_BS));
+    __ andi(tmp0, tmp0, SHA3_RATE_BIT5_MASK);
+    __ beqz(tmp0, rounds24_preloop);    // 72: SHA3-512
+    // 104: absorb lane9-lane12 (+32 over the 72 prefix)
+    sha3_gpr_xor_lane(buf, 0,  lane9,  tmp0);
+    sha3_gpr_xor_lane(buf, 8,  lane10, tmp0);
+    sha3_gpr_xor_lane(buf, 16, lane11, tmp0);
+    sha3_gpr_xor_lane(buf, 24, lane12, tmp0);
+    __ addi(buf, buf, SHA3_384_BLOCK_SIZE - SHA3_512_BLOCK_SIZE);
+    __ j(rounds24_preloop);
+
+    __ BIND(rounds24_preloop);
+    // Save buf for multi_block; setup round constant pointer
+    __ sd(buf, Address(sp, SHA3_BUF));
+    sha3_gpr_init_rc(tmp0);
+
+    __ BIND(loop_body);
+    keccak_round_gpr(r, loop_body);
+
+    if (multi_block) {
+      // Multi-block: state stays in registers across blocks.
+      // Only update ofs and loop; store state once after the loop.
+      // Java contract (implCompressMB): limit is the offset where the
+      // last full block starts, so blocks are processed while ofs <= limit.
+      __ ld(tmp0, Address(sp, SHA3_BS));      // tmp0 = block_size
+      __ ld(tmp1, Address(sp, SHA3_OFS));     // tmp1 = ofs (x10, aliases buf)
+      __ add(tmp1, tmp1, tmp0);             // tmp1 = ofs + block_size
+      __ sd(tmp1, Address(sp, SHA3_OFS));     // save updated ofs
+      __ ld(tmp0, Address(sp, SHA3_LIMIT));   // tmp0 = limit
+      Label sha3_done;
+      __ bgt(tmp1, tmp0, sha3_done);        // if ofs > limit, done
+      __ ld(buf, Address(sp, SHA3_BUF));      // reload buf
+      __ j(sha3_loop);
+      __ BIND(sha3_done);
+      // tmp1 (x10 == c_rarg0) already holds the final ofs - the return
+      // value. Store state using tmp0 (x12) as base so tmp1 is not
+      // clobbered.
+      __ ld(tmp0, Address(sp, SHA3_STATE));
+      sha3_gpr_store_state(tmp0, r);
+    } else {
+      // Single-block: store state immediately after Keccak rounds.
+      // Must NOT load the pointer into state (x11): x11 is lane lane18, so
+      // that would destroy the lane value before it is stored. Use tmp0.
+      __ ld(tmp0, Address(sp, SHA3_STATE));
+      sha3_gpr_store_state(tmp0, r);
+    }
+
+    // Epilogue
+    sha3_gpr_epilogue();
+
+    BLOCK_COMMENT("} sha3_implCompress_gpr");
+    store_archive_data(stub_id, start, __ pc());
+    return start;
+  }
+
+  address generate_double_keccak_gpr() {
+    StubId stub_id = StubId::stubgen_double_keccak_id;
+    int entry_count = StubInfo::entry_count(stub_id);
+    assert(entry_count == 1, "sanity check");
+    address start = load_archive_data(stub_id);
+    if (start != nullptr) {
+      return start;
+    }
+    __ align(CodeEntryAlignment);
+    StubCodeMark mark(this, stub_id);
+    start = __ pc();
+    BLOCK_COMMENT("double_keccak_gpr {");
+
+    Register state0 = c_rarg0;
+    Register state1 = c_rarg1;
+
+    Sha3GprRegs r;
+
+    __ enter();
+    __ subi(sp, sp, SHA3_GPR_FRAME);
+
+    sha3_gpr_save_callee_saved();
+
+    // state0 (c_rarg0=x10) aliases tmp1, state1 (c_rarg1=x11) aliases
+    // lane18; both are clobbered during the rounds, so the pointers are
+    // kept on the stack and reloaded around each permutation.
+    __ sd(state0, Address(sp, SHA3_BUF));
+    __ sd(state1, Address(sp, SHA3_STATE));
+
+    Label loop0;
+    sha3_gpr_permute(SHA3_BUF, r, loop0);
+
+    Label loop1;
+    sha3_gpr_permute(SHA3_STATE, r, loop1);
+
+    __ li(c_rarg0, 0);
+
+    sha3_gpr_epilogue();
+
+    BLOCK_COMMENT("} double_keccak_gpr");
+    store_archive_data(stub_id, start, __ pc());
+    return start;
+  }
+
 #endif // COMPILER2
 
   // x10 = input (float16)
@@ -8041,6 +8596,12 @@ static const int64_t right_3_bits = right_n_bits(3);
       Sha2Generator sha2(_masm, this);
       StubRoutines::_sha512_implCompress   = sha2.generate_sha512_implCompress(StubId::stubgen_sha512_implCompress_id);
       StubRoutines::_sha512_implCompressMB = sha2.generate_sha512_implCompress(StubId::stubgen_sha512_implCompressMB_id);
+    }
+
+    if (UseSHA3Intrinsics) {
+      StubRoutines::_sha3_implCompress   = generate_sha3_implCompress_gpr(StubId::stubgen_sha3_implCompress_id);
+      StubRoutines::_sha3_implCompressMB = generate_sha3_implCompress_gpr(StubId::stubgen_sha3_implCompressMB_id);
+      StubRoutines::_double_keccak       = generate_double_keccak_gpr();
     }
 
     if (UseMD5Intrinsics) {

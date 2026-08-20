@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -104,16 +104,19 @@ public class IntrinsicPredicates {
                               new CPUSpecificPredicate("x86_64",    new String[] { "avx2", "bmi2" }, null))))))))));
 
     public static final BooleanSupplier SHA3_INSTRUCTION_AVAILABLE
-            // sha3 is only implemented on aarch64 and avx512 for now
+            // sha3 is implemented on aarch64 (sha3 ext), avx512, and riscv64 (Zbb scalar path)
             = new OrPredicate(new CPUSpecificPredicate("aarch64.*", new String[] {"sha3"               }, null),
               new OrPredicate(new CPUSpecificPredicate("amd64.*",   new String[] {"avx512f", "avx512bw"}, null),
-                              new CPUSpecificPredicate("x86_64",    new String[] {"avx512f", "avx512bw"}, null)));
+              new OrPredicate(new CPUSpecificPredicate("x86_64",    new String[] {"avx512f", "avx512bw"}, null),
+                              new CPUSpecificPredicate("riscv64.*", new String[] {"zbb"                }, null))));
 
     public static final BooleanSupplier SHA3_INTRINSIC_AVAILABLE
             // AArch64 has both SHA3-based and GPR-based implementations of the SHA3 intrinsic. No need for the SHA3 capability.
+            // riscv64 has a GPR-based implementation requiring only Zbb.
             = new OrPredicate(new CPUSpecificPredicate("aarch64.*", null, null),
               new OrPredicate(new CPUSpecificPredicate("amd64.*",   new String[] {"avx512f", "avx512bw"}, null),
-                              new CPUSpecificPredicate("x86_64",    new String[] {"avx512f", "avx512bw"}, null)));
+              new OrPredicate(new CPUSpecificPredicate("x86_64",    new String[] {"avx512f", "avx512bw"}, null),
+                              new CPUSpecificPredicate("riscv64.*", new String[] {"zbb"}, null))));
 
     public static final BooleanSupplier ANY_SHA_INSTRUCTION_AVAILABLE
             = new OrPredicate(IntrinsicPredicates.SHA1_INSTRUCTION_AVAILABLE,
