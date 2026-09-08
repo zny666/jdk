@@ -7942,6 +7942,546 @@ static const int64_t right_3_bits = right_n_bits(3);
     return start;
   }
 
+  // ==========================================================================
+  // ML-DSA (Dilithium) intrinsics -- RVV implementations
+  // ==========================================================================
+  //
+  // Shared Montgomery reduction for all five stubs.
+  //
+  // vd = (vb * vc) * 2^-32 mod q over the current vl, at SEW=32.
+  //
+  // vmulh yields the high half of the signed 32x32->64 product directly, which
+  // is exactly what an R = 2^32 Montgomery reduction needs, so the whole thing
+  // is five instructions with no widening multiply and no LMUL change.
+  // AArch64 has no such instruction and needs an sqdmulh/shsub
+  // doubling-and-halving pair to get the same result.
+  //
+  // vh and vw are scratch and must be distinct from vb, vc, vd, vqinv and vq.
+  void dilithium_montmul_vv(VectorRegister vd, VectorRegister vb, VectorRegister vc,
+                            VectorRegister vh, VectorRegister vw,
+                            VectorRegister vqinv, VectorRegister vq) {
+    __ vmulh_vv(vh, vb, vc);        // aHigh  = (b*c) >> 32
+    __ vmul_vv(vw, vb, vc);         // aLow   = (b*c) & 0xffffffff
+    __ vmul_vv(vw, vw, vqinv);      // m      = aLow * qinv   (low 32 bits)
+    __ vmulh_vv(vw, vw, vq);        // n      = (m * q) >> 32
+    __ vsub_vv(vd, vh, vw);         // result = aHigh - n
+  }
+
+  // All five operate on int[256] polynomials with q = 8380417 and Montgomery
+  // R = 2^32, so they run at SEW=32 throughout with LMUL fixed at m1.
+  //
+  // The output must be BIT-IDENTICAL to the Java fallback rather than merely
+  // congruent mod q: both sides use R = 2^32, and the vector zeta
+  // tables are the scalar MONT_ZETAS_FOR_NTT pre-expanded verbatim (verified by
+  // reconstructing all 1024 entries of both tables from the 255 scalar zetas).
+  //
+  // Neither transform needs an intermediate reduction.  At SEW=32 the sum side
+  // grows by at most q per level, so eight levels reach about 8q = 6.7e7, far
+  // inside int32.  Bit-exactness demands this anyway: the Java fallbacks
+  // perform no intermediate reduction, so the stubs must not either.
+
+  static const int dilithium_n          = 256;
+  static const int dilithium_q          = 8380417;
+  static const int dilithium_qinv       = 58728449;  // q * qinv == 1 (mod 2^32)
+  static const int dilithium_r2         = 2365951;   // R^2 mod q
+  static const int dilithium_bar_addend = 5373807;   // decomposePoly Barrett addend
+
+  // Broadcast q^-1 and q at SEW=32.  Sets vl to VLMAX so every lane is filled.
+  // Clobbers t2, t3.
+  void dilithium_load_consts(VectorRegister vqinv, VectorRegister vq) {
+    __ vsetvli(t2, x0, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+    __ li(t3, dilithium_qinv);
+    __ vmv_v_x(vqinv, t3);
+    __ li(t3, dilithium_q);
+    __ vmv_v_x(vq, t3);
+  }
+
+  // Dilithium NTT without the final Montgomery normalisation.
+  // Implements static int implDilithiumAlmostNtt(int[] coeffs, int[] zetas)
+  //
+  // coeffs (int[256])  = c_rarg0
+  // zetas  (int[1024]) = c_rarg1, 128 entries per level over 8 levels
+  //
+  // Eight levels, l = 128 down to 1.  The l = 1 level is 128 blocks of a
+  // single butterfly each, so the cross-block gather pays off most there: 16
+  // full-width iterations instead of 128 iterations at vl == 1.
+  //
+  // mlDsaNtt() applies the trailing multiply by MONT_R_MOD_Q separately via
+  // implDilithiumMontMulByConstant, so this stub must not do it.
+  address generate_dilithiumAlmostNtt() {
+    __ align(CodeEntryAlignment);
+    StubId stub_id = StubId::stubgen_dilithiumAlmostNtt_id;
+    StubCodeMark mark(this, stub_id);
+    address start = __ pc();
+    __ enter();
+
+    const Register coeffs = c_rarg0;
+    const Register zPtr   = c_rarg1;   // +128 ints per level
+    const Register loPtr  = c_rarg2;
+    const Register hiPtr  = c_rarg3;
+    const Register vl     = c_rarg4;
+    const Register remain = c_rarg5;
+    const Register blocks = c_rarg6;
+    const Register adv    = c_rarg7;
+
+    const Register zBase  = c_rarg4;   // gather path aliases; see the comment below
+    const Register zCur   = c_rarg5;
+    const Register gVl    = c_rarg6;
+    const Register blkRem = c_rarg7;
+    const Register cs     = t2;
+    const Register zs     = t3;
+    const Register jCnt   = t4;
+    const Register gTmp   = t5;
+
+    const VectorRegister vlo = v1, vhi = v2, vz = v3, vt = v4;
+    const VectorRegister vh = v5, vw = v6;
+    const VectorRegister vqinv = v7, vq = v8;
+
+    dilithium_load_consts(vqinv, vq);
+
+    const int vlmax32 = MaxVectorSize / 4;
+
+    for (int l = dilithium_n / 2; l >= 1; l >>= 1) {
+      const int nb = dilithium_n / (2 * l);
+      const int unit_iters   = nb * ((l + vlmax32 - 1) / vlmax32);
+      const int gather_iters = ((nb + vlmax32 - 1) / vlmax32) * l;
+
+      if (gather_iters >= unit_iters) {
+        Label L_block, L_vec;
+        __ mv(loPtr, coeffs);
+        __ addi(hiPtr, loPtr, l * 4);
+        __ li(blocks, nb);
+        __ bind(L_block);
+        __ li(remain, l);
+        __ bind(L_vec);
+        __ vsetvli(vl, remain, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+        __ vle32_v(vhi, hiPtr);
+        __ vle32_v(vz, zPtr);
+        dilithium_montmul_vv(vt, vz, vhi, vh, vw, vqinv, vq);
+        __ vle32_v(vlo, loPtr);
+        __ vadd_vv(vhi, vlo, vt);
+        __ vse32_v(vhi, loPtr);
+        __ vsub_vv(vhi, vlo, vt);
+        __ vse32_v(vhi, hiPtr);
+        __ slli(adv, vl, 2);
+        __ add(loPtr, loPtr, adv);
+        __ add(hiPtr, hiPtr, adv);
+        __ add(zPtr, zPtr, adv);
+        __ sub(remain, remain, vl);
+        __ bgtz(remain, L_vec);
+        // The vector loop left loPtr on this block's hi half and hiPtr one
+        // block beyond it, so both need exactly l more elements to land on the
+        // next block's lo and hi.
+        __ addi(loPtr, loPtr, l * 4);
+        __ addi(hiPtr, hiPtr, l * 4);
+        __ addi(blocks, blocks, -1);
+        __ bgtz(blocks, L_block);
+
+      } else {
+        int log2l = 0;
+        while ((1 << log2l) != l) log2l++;
+
+        Label L_chunk, L_j;
+        __ mv(loPtr, coeffs);
+        __ mv(zBase, zPtr);
+        __ li(blkRem, nb);
+        __ li(cs, 2 * l * 4);
+        __ li(zs, l * 4);
+        __ bind(L_chunk);
+        __ vsetvli(gVl, blkRem, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+        __ addi(hiPtr, loPtr, l * 4);
+        __ mv(zCur, zBase);
+        __ li(jCnt, l);
+        __ bind(L_j);
+        __ vlse32_v(vhi, hiPtr, cs);
+        __ vlse32_v(vz, zCur, zs);
+        dilithium_montmul_vv(vt, vz, vhi, vh, vw, vqinv, vq);
+        __ vlse32_v(vlo, loPtr, cs);
+        __ vadd_vv(vhi, vlo, vt);
+        __ vsse32_v(vhi, loPtr, cs);
+        __ vsub_vv(vhi, vlo, vt);
+        __ vsse32_v(vhi, hiPtr, cs);
+        __ addi(loPtr, loPtr, 4);
+        __ addi(hiPtr, hiPtr, 4);
+        __ addi(zCur, zCur, 4);
+        __ addi(jCnt, jCnt, -1);
+        __ bgtz(jCnt, L_j);
+        __ slli(gTmp, gVl, log2l + 1);
+        __ addi(gTmp, gTmp, -l);
+        __ slli(gTmp, gTmp, 2);
+        __ add(loPtr, loPtr, gTmp);
+        __ slli(gTmp, gVl, log2l);
+        __ slli(gTmp, gTmp, 2);
+        __ add(zBase, zBase, gTmp);
+        __ sub(blkRem, blkRem, gVl);
+        __ bgtz(blkRem, L_chunk);
+        __ addi(zPtr, zPtr, 128 * 4);
+      }
+    }
+
+    __ mv(c_rarg0, 0);
+    __ leave();
+    __ ret();
+
+    return start;
+  }
+
+  // Dilithium inverse NTT without the final Montgomery normalisation.
+  // Implements static int implDilithiumAlmostInverseNtt(int[] coeffs, int[] zetas)
+  //
+  // coeffs (int[256])  = c_rarg0
+  // zetas  (int[1024]) = c_rarg1
+  //
+  // Eight levels, l = 1 up to 128.  mlDsaInverseNtt() applies the trailing
+  // multiply by MONT_DIM_INVERSE separately.
+  address generate_dilithiumAlmostInverseNtt() {
+    __ align(CodeEntryAlignment);
+    StubId stub_id = StubId::stubgen_dilithiumAlmostInverseNtt_id;
+    StubCodeMark mark(this, stub_id);
+    address start = __ pc();
+    __ enter();
+
+    const Register coeffs = c_rarg0;
+    const Register zPtr   = c_rarg1;
+    const Register loPtr  = c_rarg2;
+    const Register hiPtr  = c_rarg3;
+    const Register vl     = c_rarg4;
+    const Register remain = c_rarg5;
+    const Register blocks = c_rarg6;
+    const Register adv    = c_rarg7;
+
+    const Register zBase  = c_rarg4;
+    const Register zCur   = c_rarg5;
+    const Register gVl    = c_rarg6;
+    const Register blkRem = c_rarg7;
+    const Register cs     = t2;
+    const Register zs     = t3;
+    const Register jCnt   = t4;
+    const Register gTmp   = t5;
+
+    const VectorRegister vlo = v1, vhi = v2, vz = v3, vt = v4;
+    const VectorRegister vh = v5, vw = v6;
+    const VectorRegister vqinv = v7, vq = v8;
+
+    dilithium_load_consts(vqinv, vq);
+
+    const int vlmax32 = MaxVectorSize / 4;
+
+    for (int l = 1; l < dilithium_n; l <<= 1) {
+      const int nb = dilithium_n / (2 * l);
+      const int unit_iters   = nb * ((l + vlmax32 - 1) / vlmax32);
+      const int gather_iters = ((nb + vlmax32 - 1) / vlmax32) * l;
+
+      if (gather_iters >= unit_iters) {
+        Label L_block, L_vec;
+        __ mv(loPtr, coeffs);
+        __ addi(hiPtr, loPtr, l * 4);
+        __ li(blocks, nb);
+        __ bind(L_block);
+        __ li(remain, l);
+        __ bind(L_vec);
+        __ vsetvli(vl, remain, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+        __ vle32_v(vlo, loPtr);
+        __ vle32_v(vhi, hiPtr);
+        __ vle32_v(vz, zPtr);
+        __ vsub_vv(vt, vlo, vhi);            // diff, before lo/hi are overwritten
+        __ vadd_vv(vhi, vlo, vhi);           // sum
+        __ vse32_v(vhi, loPtr);
+        dilithium_montmul_vv(vt, vt, vz, vh, vw, vqinv, vq);
+        __ vse32_v(vt, hiPtr);
+        __ slli(adv, vl, 2);
+        __ add(loPtr, loPtr, adv);
+        __ add(hiPtr, hiPtr, adv);
+        __ add(zPtr, zPtr, adv);
+        __ sub(remain, remain, vl);
+        __ bgtz(remain, L_vec);
+        // The vector loop left loPtr on this block's hi half and hiPtr one
+        // block beyond it, so both need exactly l more elements to land on the
+        // next block's lo and hi.
+        __ addi(loPtr, loPtr, l * 4);
+        __ addi(hiPtr, hiPtr, l * 4);
+        __ addi(blocks, blocks, -1);
+        __ bgtz(blocks, L_block);
+
+      } else {
+        int log2l = 0;
+        while ((1 << log2l) != l) log2l++;
+
+        Label L_chunk, L_j;
+        __ mv(loPtr, coeffs);
+        __ mv(zBase, zPtr);
+        __ li(blkRem, nb);
+        __ li(cs, 2 * l * 4);
+        __ li(zs, l * 4);
+        __ bind(L_chunk);
+        __ vsetvli(gVl, blkRem, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+        __ addi(hiPtr, loPtr, l * 4);
+        __ mv(zCur, zBase);
+        __ li(jCnt, l);
+        __ bind(L_j);
+        __ vlse32_v(vlo, loPtr, cs);
+        __ vlse32_v(vhi, hiPtr, cs);
+        __ vlse32_v(vz, zCur, zs);
+        __ vsub_vv(vt, vlo, vhi);
+        __ vadd_vv(vhi, vlo, vhi);
+        __ vsse32_v(vhi, loPtr, cs);
+        dilithium_montmul_vv(vt, vt, vz, vh, vw, vqinv, vq);
+        __ vsse32_v(vt, hiPtr, cs);
+        __ addi(loPtr, loPtr, 4);
+        __ addi(hiPtr, hiPtr, 4);
+        __ addi(zCur, zCur, 4);
+        __ addi(jCnt, jCnt, -1);
+        __ bgtz(jCnt, L_j);
+        __ slli(gTmp, gVl, log2l + 1);
+        __ addi(gTmp, gTmp, -l);
+        __ slli(gTmp, gTmp, 2);
+        __ add(loPtr, loPtr, gTmp);
+        __ slli(gTmp, gVl, log2l);
+        __ slli(gTmp, gTmp, 2);
+        __ add(zBase, zBase, gTmp);
+        __ sub(blkRem, blkRem, gVl);
+        __ bgtz(blkRem, L_chunk);
+        __ addi(zPtr, zPtr, 128 * 4);
+      }
+    }
+
+    __ mv(c_rarg0, 0);
+    __ leave();
+    __ ret();
+
+    return start;
+  }
+
+  // Dilithium pointwise multiply in the NTT domain.
+  // Implements static int implDilithiumNttMult(int[] product, int[] c1, int[] c2)
+  //   product[i] = montMul(c1[i], toMont(c2[i]))   where toMont(a) = montMul(a, R^2)
+  //
+  // product (int[256]) = c_rarg0
+  // c1      (int[256]) = c_rarg1
+  // c2      (int[256]) = c_rarg2
+  //
+  // Only three pointer arguments reach the stub: library_call.cpp reads a
+  // fourth "zetas" node but does not pass it, and the pointwise product needs
+  // no zetas of its own -- the product is purely pointwise.
+  address generate_dilithiumNttMult() {
+    __ align(CodeEntryAlignment);
+    StubId stub_id = StubId::stubgen_dilithiumNttMult_id;
+    StubCodeMark mark(this, stub_id);
+    address start = __ pc();
+    __ enter();
+
+    const Register product = c_rarg0;
+    const Register c1Ptr   = c_rarg1;
+    const Register c2Ptr   = c_rarg2;
+    const Register vl      = c_rarg3;
+    const Register remain  = c_rarg4;
+    const Register adv     = c_rarg5;
+
+    const VectorRegister va = v1, vb = v2, vr = v3;
+    const VectorRegister vh = v5, vw = v6;
+    const VectorRegister vqinv = v7, vq = v8, vR2 = v9;
+
+    __ vsetvli(t2, x0, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+    __ li(t3, dilithium_qinv);
+    __ vmv_v_x(vqinv, t3);
+    __ li(t3, dilithium_q);
+    __ vmv_v_x(vq, t3);
+    __ li(t3, dilithium_r2);
+    __ vmv_v_x(vR2, t3);
+    __ li(remain, dilithium_n);
+
+    Label L_loop;
+    __ bind(L_loop);
+    __ vsetvli(vl, remain, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+    __ vle32_v(va, c1Ptr);
+    __ vle32_v(vb, c2Ptr);
+    dilithium_montmul_vv(vr, vb, vR2, vh, vw, vqinv, vq);   // toMont(c2)
+    dilithium_montmul_vv(vr, va, vr,  vh, vw, vqinv, vq);   // montMul(c1, toMont(c2))
+    __ vse32_v(vr, product);
+    __ slli(adv, vl, 2);
+    __ add(product, product, adv);
+    __ add(c1Ptr,   c1Ptr,   adv);
+    __ add(c2Ptr,   c2Ptr,   adv);
+    __ sub(remain, remain, vl);
+    __ bgtz(remain, L_loop);
+
+    __ mv(c_rarg0, 0);
+    __ leave();
+    __ ret();
+
+    return start;
+  }
+
+  // Dilithium multiply every coefficient by a runtime constant.
+  // Implements static int implDilithiumMontMulByConstant(int[] coeffs, int constant)
+  //
+  // coeffs   (int[256]) = c_rarg0, in place
+  // constant (int)      = c_rarg1
+  //
+  // The two constants actually passed in practice are MONT_R_MOD_Q (after the
+  // forward NTT) and MONT_DIM_INVERSE (after the inverse NTT), but the value
+  // is a runtime argument so it is broadcast rather than baked in.
+  address generate_dilithiumMontMulByConstant() {
+    __ align(CodeEntryAlignment);
+    StubId stub_id = StubId::stubgen_dilithiumMontMulByConstant_id;
+    StubCodeMark mark(this, stub_id);
+    address start = __ pc();
+    __ enter();
+
+    const Register coeffs   = c_rarg0;
+    const Register constant = c_rarg1;
+    const Register vl       = c_rarg2;
+    const Register remain   = c_rarg3;
+    const Register adv      = c_rarg4;
+
+    const VectorRegister vv = v1, vc = v2;
+    const VectorRegister vh = v5, vw = v6;
+    const VectorRegister vqinv = v7, vq = v8;
+
+    __ vsetvli(t2, x0, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+    __ li(t3, dilithium_qinv);
+    __ vmv_v_x(vqinv, t3);
+    __ li(t3, dilithium_q);
+    __ vmv_v_x(vq, t3);
+    __ vmv_v_x(vc, constant);            // SEW=32 takes the low 32 bits
+    __ li(remain, dilithium_n);
+
+    Label L_loop;
+    __ bind(L_loop);
+    __ vsetvli(vl, remain, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+    __ vle32_v(vv, coeffs);
+    dilithium_montmul_vv(vv, vv, vc, vh, vw, vqinv, vq);
+    __ vse32_v(vv, coeffs);
+    __ slli(adv, vl, 2);
+    __ add(coeffs, coeffs, adv);
+    __ sub(remain, remain, vl);
+    __ bgtz(remain, L_loop);
+
+    __ mv(c_rarg0, 0);
+    __ leave();
+    __ ret();
+
+    return start;
+  }
+
+  // Dilithium decompose each coefficient into (highPart, lowPart).
+  // Implements static int implDilithiumDecomposePoly(
+  //                  int[] input, int[] lowPart, int[] highPart,
+  //                  int twoGamma2, int multiplier)
+  //
+  // input      (int[256]) = c_rarg0
+  // lowPart    (int[256]) = c_rarg1
+  // highPart   (int[256]) = c_rarg2
+  // twoGamma2  (int)      = c_rarg3   190464 for ML-DSA-44, 523776 for 65/87
+  // multiplier (int)      = c_rarg4   22 for ML-DSA-44, 8 for 65/87
+  //
+  // gamma2 is not passed, so it is derived as twoGamma2 >> 1 (twoGamma2 is
+  // positive and even for both parameter sets).
+  //
+  // A straight transcription of decomposePolyJava.  The two conditional
+  // adjustments use masks that are 0 or -1, so they are plain ANDs -- no mask
+  // registers and no branches.  Note RVV has no vrsub.vv, so the
+  // "constant - vector" operands are written as vsub with the broadcast
+  // constant first.
+  address generate_dilithiumDecomposePoly() {
+    __ align(CodeEntryAlignment);
+    StubId stub_id = StubId::stubgen_dilithiumDecomposePoly_id;
+    StubCodeMark mark(this, stub_id);
+    address start = __ pc();
+    __ enter();
+
+    const Register input   = c_rarg0;
+    const Register lowPtr  = c_rarg1;
+    const Register highPtr = c_rarg2;
+    const Register twoG2   = c_rarg3;   // preserved across the loop
+    const Register mult    = c_rarg4;   // preserved across the loop
+    const Register vl      = c_rarg5;
+    const Register remain  = c_rarg6;
+    const Register adv     = c_rarg7;
+    const Register gamma2  = t2;
+    const Register tmp     = t4;
+
+    const VectorRegister vrp = v1, vquot = v2, vr0 = v3, vr1 = v4;
+    const VectorRegister vmask = v5, vt = v6;
+    const VectorRegister vq = v7, vaddend = v8, v2g = v9, vg = v10, vqm1 = v11;
+
+    __ vsetvli(tmp, x0, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+    __ li(t3, dilithium_q);
+    __ vmv_v_x(vq, t3);
+    __ li(t3, dilithium_bar_addend);
+    __ vmv_v_x(vaddend, t3);
+    __ li(t3, dilithium_q - 1);
+    __ vmv_v_x(vqm1, t3);
+    __ vmv_v_x(v2g, twoG2);
+    __ srli(gamma2, twoG2, 1);
+    __ vmv_v_x(vg, gamma2);
+    __ li(remain, dilithium_n);
+
+    Label L_loop;
+    __ bind(L_loop);
+    __ vsetvli(vl, remain, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
+    __ vle32_v(vrp, input);
+
+    // rplus -= ((rplus + addend) >> 23) * q
+    __ vadd_vv(vt, vrp, vaddend);
+    __ vsra_vi(vt, vt, 23);
+    __ vmul_vv(vt, vt, vq);
+    __ vsub_vv(vrp, vrp, vt);
+    // rplus += ((rplus >> 31) & q)
+    __ vsra_vi(vt, vrp, 31);
+    __ vand_vv(vt, vt, vq);
+    __ vadd_vv(vrp, vrp, vt);
+
+    // quotient = (rplus * multiplier) >> 22
+    __ vmul_vx(vquot, vrp, mult);
+    __ vsra_vi(vquot, vquot, 22);
+    // r0 = rplus - quotient * twoGamma2
+    __ vmul_vv(vt, vquot, v2g);
+    __ vsub_vv(vr0, vrp, vt);
+
+    // mask = (twoGamma2 - r0) >> 22;  r0 -= mask & twoGamma2;  quotient += mask & 1
+    __ vsub_vv(vmask, v2g, vr0);
+    __ vsra_vi(vmask, vmask, 22);
+    __ vand_vv(vt, vmask, v2g);
+    __ vsub_vv(vr0, vr0, vt);
+    __ vand_vi(vt, vmask, 1);
+    __ vadd_vv(vquot, vquot, vt);
+
+    // mask = (gamma2 - r0) >> 31;  same two adjustments
+    __ vsub_vv(vmask, vg, vr0);
+    __ vsra_vi(vmask, vmask, 31);
+    __ vand_vv(vt, vmask, v2g);
+    __ vsub_vv(vr0, vr0, vt);
+    __ vand_vi(vt, vmask, 1);
+    __ vadd_vv(vquot, vquot, vt);
+
+    // r1 = rplus - r0 - (q - 1);  r1 = (r1 | -r1) >> 31
+    __ vsub_vv(vr1, vrp, vr0);
+    __ vsub_vv(vr1, vr1, vqm1);
+    __ vrsub_vi(vt, vr1, 0);            // -r1
+    __ vor_vv(vr1, vr1, vt);
+    __ vsra_vi(vr1, vr1, 31);           // 0 iff rplus-r0 == q-1, else -1
+    // r0 += ~r1;  r1 = r1 & quotient
+    __ vxor_vi(vt, vr1, -1);            // ~r1
+    __ vadd_vv(vr0, vr0, vt);
+    __ vand_vv(vr1, vr1, vquot);
+
+    __ vse32_v(vr0, lowPtr);
+    __ vse32_v(vr1, highPtr);
+    __ slli(adv, vl, 2);
+    __ add(input,   input,   adv);
+    __ add(lowPtr,  lowPtr,  adv);
+    __ add(highPtr, highPtr, adv);
+    __ sub(remain, remain, vl);
+    __ bgtz(remain, L_loop);
+
+    __ mv(c_rarg0, 0);
+    __ leave();
+    __ ret();
+
+    return start;
+  }
+
 #undef __
 
   // Initialization
@@ -8126,6 +8666,14 @@ static const int64_t right_3_bits = right_n_bits(3);
 
     if (UseAdler32Intrinsics) {
       StubRoutines::_updateBytesAdler32 = generate_updateBytesAdler32();
+    }
+
+    if (UseDilithiumIntrinsics) {
+      StubRoutines::_dilithiumAlmostNtt = generate_dilithiumAlmostNtt();
+      StubRoutines::_dilithiumAlmostInverseNtt = generate_dilithiumAlmostInverseNtt();
+      StubRoutines::_dilithiumNttMult = generate_dilithiumNttMult();
+      StubRoutines::_dilithiumMontMulByConstant = generate_dilithiumMontMulByConstant();
+      StubRoutines::_dilithiumDecomposePoly = generate_dilithiumDecomposePoly();
     }
 
     generate_compare_long_strings();
