@@ -8019,19 +8019,8 @@ static const int64_t right_3_bits = right_n_bits(3);
     const Register zPtr   = c_rarg1;   // +128 ints per level
     const Register loPtr  = c_rarg2;
     const Register hiPtr  = c_rarg3;
-    const Register vl     = c_rarg4;
-    const Register remain = c_rarg5;
-    const Register blocks = c_rarg6;
-    const Register adv    = c_rarg7;
-
-    const Register zBase  = c_rarg4;   // gather path aliases; see the comment below
-    const Register zCur   = c_rarg5;
-    const Register gVl    = c_rarg6;
-    const Register blkRem = c_rarg7;
-    const Register cs     = t2;
-    const Register zs     = t3;
-    const Register jCnt   = t4;
-    const Register gTmp   = t5;
+    // c_rarg4..c_rarg7 are scratch and mean something different in each of the
+    // two level strategies below, so they are named inside those branches.
 
     const VectorRegister vlo = v1, vhi = v2, vz = v3, vt = v4;
     const VectorRegister vh = v5, vw = v6;
@@ -8047,6 +8036,11 @@ static const int64_t right_3_bits = right_n_bits(3);
       const int gather_iters = ((nb + vlmax32 - 1) / vlmax32) * l;
 
       if (gather_iters >= unit_iters) {
+        const Register vl     = c_rarg4;
+        const Register remain = c_rarg5;
+        const Register blocks = c_rarg6;
+        const Register adv    = c_rarg7;
+
         Label L_block, L_vec;
         __ mv(loPtr, coeffs);
         __ addi(hiPtr, loPtr, l * 4);
@@ -8078,6 +8072,15 @@ static const int64_t right_3_bits = right_n_bits(3);
         __ bgtz(blocks, L_block);
 
       } else {
+        const Register zBase  = c_rarg4;
+        const Register zCur   = c_rarg5;
+        const Register gVl    = c_rarg6;
+        const Register blkRem = c_rarg7;
+        const Register cs     = t2;
+        const Register zs     = t3;
+        const Register jCnt   = t4;
+        const Register gTmp   = t5;
+
         int log2l = 0;
         while ((1 << log2l) != l) log2l++;
 
@@ -8145,19 +8148,8 @@ static const int64_t right_3_bits = right_n_bits(3);
     const Register zPtr   = c_rarg1;
     const Register loPtr  = c_rarg2;
     const Register hiPtr  = c_rarg3;
-    const Register vl     = c_rarg4;
-    const Register remain = c_rarg5;
-    const Register blocks = c_rarg6;
-    const Register adv    = c_rarg7;
-
-    const Register zBase  = c_rarg4;
-    const Register zCur   = c_rarg5;
-    const Register gVl    = c_rarg6;
-    const Register blkRem = c_rarg7;
-    const Register cs     = t2;
-    const Register zs     = t3;
-    const Register jCnt   = t4;
-    const Register gTmp   = t5;
+    // c_rarg4..c_rarg7 are scratch and mean something different in each of the
+    // two level strategies below, so they are named inside those branches.
 
     const VectorRegister vlo = v1, vhi = v2, vz = v3, vt = v4;
     const VectorRegister vh = v5, vw = v6;
@@ -8173,6 +8165,11 @@ static const int64_t right_3_bits = right_n_bits(3);
       const int gather_iters = ((nb + vlmax32 - 1) / vlmax32) * l;
 
       if (gather_iters >= unit_iters) {
+        const Register vl     = c_rarg4;
+        const Register remain = c_rarg5;
+        const Register blocks = c_rarg6;
+        const Register adv    = c_rarg7;
+
         Label L_block, L_vec;
         __ mv(loPtr, coeffs);
         __ addi(hiPtr, loPtr, l * 4);
@@ -8204,6 +8201,15 @@ static const int64_t right_3_bits = right_n_bits(3);
         __ bgtz(blocks, L_block);
 
       } else {
+        const Register zBase  = c_rarg4;
+        const Register zCur   = c_rarg5;
+        const Register gVl    = c_rarg6;
+        const Register blkRem = c_rarg7;
+        const Register cs     = t2;
+        const Register zs     = t3;
+        const Register jCnt   = t4;
+        const Register gTmp   = t5;
+
         int log2l = 0;
         while ((1 << log2l) != l) log2l++;
 
