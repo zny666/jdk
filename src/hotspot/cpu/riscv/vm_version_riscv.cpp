@@ -525,10 +525,7 @@ void VM_Version::c2_initialize() {
     }
   }
 
-  // ML-DSA (Dilithium).  The stubs use only base RVV at SEW=32 -- vmulh/vmul
-  // for the Montgomery reduction, shifts and logical ops, plus unit-stride and
-  // strided loads/stores -- so no Zvbb/Zvkb or vector-crypto extension is
-  // required and UseRVV is sufficient.
+  // The ML-DSA stubs use base RVV instructions at SEW=32.
   if (UseRVV) {
     if (FLAG_IS_DEFAULT(UseDilithiumIntrinsics)) {
       FLAG_SET_DEFAULT(UseDilithiumIntrinsics, true);

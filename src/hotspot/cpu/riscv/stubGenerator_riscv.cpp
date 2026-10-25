@@ -7942,21 +7942,7 @@ static const int64_t right_3_bits = right_n_bits(3);
     return start;
   }
 
-  // ==========================================================================
-  // ML-DSA (Dilithium) intrinsics -- RVV implementations
-  // ==========================================================================
-  //
-  // Shared Montgomery reduction for all five stubs.
-  //
-  // vd = (vb * vc) * 2^-32 mod q over the current vl, at SEW=32.
-  //
-  // vmulh yields the high half of the signed 32x32->64 product directly, which
-  // is exactly what an R = 2^32 Montgomery reduction needs, so the whole thing
-  // is five instructions with no widening multiply and no LMUL change.
-  // AArch64 has no such instruction and needs an sqdmulh/shsub
-  // doubling-and-halving pair to get the same result.
-  //
-  // vh and vw are scratch and must be distinct from vb, vc, vd, vqinv and vq.
+  // ML-DSA Montgomery reduction at SEW=32: vd = vb * vc * 2^-32 mod q.
   void dilithium_montmul_vv(VectorRegister vd, VectorRegister vb, VectorRegister vc,
                             VectorRegister vh, VectorRegister vw,
                             VectorRegister vqinv, VectorRegister vq) {
@@ -7967,27 +7953,13 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ vsub_vv(vd, vh, vw);         // result = aHigh - n
   }
 
-  // All five operate on int[256] polynomials with q = 8380417 and Montgomery
-  // R = 2^32, so they run at SEW=32 throughout with LMUL fixed at m1.
-  //
-  // The output must be BIT-IDENTICAL to the Java fallback rather than merely
-  // congruent mod q: both sides use R = 2^32, and the vector zeta
-  // tables are the scalar MONT_ZETAS_FOR_NTT pre-expanded verbatim (verified by
-  // reconstructing all 1024 entries of both tables from the 255 scalar zetas).
-  //
-  // Neither transform needs an intermediate reduction.  At SEW=32 the sum side
-  // grows by at most q per level, so eight levels reach about 8q = 6.7e7, far
-  // inside int32.  Bit-exactness demands this anyway: the Java fallbacks
-  // perform no intermediate reduction, so the stubs must not either.
-
   static const int dilithium_n          = 256;
   static const int dilithium_q          = 8380417;
-  static const int dilithium_qinv       = 58728449;  // q * qinv == 1 (mod 2^32)
-  static const int dilithium_r2         = 2365951;   // R^2 mod q
-  static const int dilithium_bar_addend = 5373807;   // decomposePoly Barrett addend
+  static const int dilithium_qinv       = 58728449;
+  static const int dilithium_r2         = 2365951;
+  static const int dilithium_bar_addend = 5373807;
 
-  // Broadcast q^-1 and q at SEW=32.  Sets vl to VLMAX so every lane is filled.
-  // Clobbers t2, t3.
+  // Broadcast q^-1 and q at SEW=32. Clobbers t2 and t3.
   void dilithium_load_consts(VectorRegister vqinv, VectorRegister vq) {
     __ vsetvli(t2, x0, Assembler::e32, Assembler::m1, Assembler::ma, Assembler::ta);
     __ li(t3, dilithium_qinv);
@@ -7996,32 +7968,25 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ vmv_v_x(vq, t3);
   }
 
-  // Dilithium NTT without the final Montgomery normalisation.
-  // Implements static int implDilithiumAlmostNtt(int[] coeffs, int[] zetas)
-  //
-  // coeffs (int[256])  = c_rarg0
-  // zetas  (int[1024]) = c_rarg1, 128 entries per level over 8 levels
-  //
-  // Eight levels, l = 128 down to 1.  The l = 1 level is 128 blocks of a
-  // single butterfly each, so the cross-block gather pays off most there: 16
-  // full-width iterations instead of 128 iterations at vl == 1.
-  //
-  // mlDsaNtt() applies the trailing multiply by MONT_R_MOD_Q separately via
-  // implDilithiumMontMulByConstant, so this stub must not do it.
+  // NTT without the final Montgomery normalization. Each level uses the access
+  // pattern that requires fewer vector iterations.
   address generate_dilithiumAlmostNtt() {
-    __ align(CodeEntryAlignment);
     StubId stub_id = StubId::stubgen_dilithiumAlmostNtt_id;
+    int entry_count = StubInfo::entry_count(stub_id);
+    assert(entry_count == 1, "sanity check");
+    address start = load_archive_data(stub_id);
+    if (start != nullptr) {
+      return start;
+    }
+    __ align(CodeEntryAlignment);
     StubCodeMark mark(this, stub_id);
-    address start = __ pc();
+    start = __ pc();
     __ enter();
 
     const Register coeffs = c_rarg0;
     const Register zPtr   = c_rarg1;   // +128 ints per level
     const Register loPtr  = c_rarg2;
     const Register hiPtr  = c_rarg3;
-    // c_rarg4..c_rarg7 are scratch and mean something different in each of the
-    // two level strategies below, so they are named inside those branches.
-
     const VectorRegister vlo = v1, vhi = v2, vz = v3, vt = v4;
     const VectorRegister vh = v5, vw = v6;
     const VectorRegister vqinv = v7, vq = v8;
@@ -8063,9 +8028,7 @@ static const int64_t right_3_bits = right_n_bits(3);
         __ add(zPtr, zPtr, adv);
         __ sub(remain, remain, vl);
         __ bgtz(remain, L_vec);
-        // The vector loop left loPtr on this block's hi half and hiPtr one
-        // block beyond it, so both need exactly l more elements to land on the
-        // next block's lo and hi.
+        // Advance from the end of this block to the next pair of halves.
         __ addi(loPtr, loPtr, l * 4);
         __ addi(hiPtr, hiPtr, l * 4);
         __ addi(blocks, blocks, -1);
@@ -8126,31 +8089,28 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ leave();
     __ ret();
 
+    store_archive_data(stub_id, start, __ pc());
     return start;
   }
 
-  // Dilithium inverse NTT without the final Montgomery normalisation.
-  // Implements static int implDilithiumAlmostInverseNtt(int[] coeffs, int[] zetas)
-  //
-  // coeffs (int[256])  = c_rarg0
-  // zetas  (int[1024]) = c_rarg1
-  //
-  // Eight levels, l = 1 up to 128.  mlDsaInverseNtt() applies the trailing
-  // multiply by MONT_DIM_INVERSE separately.
+  // Inverse NTT without the final Montgomery normalization.
   address generate_dilithiumAlmostInverseNtt() {
-    __ align(CodeEntryAlignment);
     StubId stub_id = StubId::stubgen_dilithiumAlmostInverseNtt_id;
+    int entry_count = StubInfo::entry_count(stub_id);
+    assert(entry_count == 1, "sanity check");
+    address start = load_archive_data(stub_id);
+    if (start != nullptr) {
+      return start;
+    }
+    __ align(CodeEntryAlignment);
     StubCodeMark mark(this, stub_id);
-    address start = __ pc();
+    start = __ pc();
     __ enter();
 
     const Register coeffs = c_rarg0;
     const Register zPtr   = c_rarg1;
     const Register loPtr  = c_rarg2;
     const Register hiPtr  = c_rarg3;
-    // c_rarg4..c_rarg7 are scratch and mean something different in each of the
-    // two level strategies below, so they are named inside those branches.
-
     const VectorRegister vlo = v1, vhi = v2, vz = v3, vt = v4;
     const VectorRegister vh = v5, vw = v6;
     const VectorRegister vqinv = v7, vq = v8;
@@ -8192,9 +8152,7 @@ static const int64_t right_3_bits = right_n_bits(3);
         __ add(zPtr, zPtr, adv);
         __ sub(remain, remain, vl);
         __ bgtz(remain, L_vec);
-        // The vector loop left loPtr on this block's hi half and hiPtr one
-        // block beyond it, so both need exactly l more elements to land on the
-        // next block's lo and hi.
+        // Advance from the end of this block to the next pair of halves.
         __ addi(loPtr, loPtr, l * 4);
         __ addi(hiPtr, hiPtr, l * 4);
         __ addi(blocks, blocks, -1);
@@ -8255,25 +8213,23 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ leave();
     __ ret();
 
+    store_archive_data(stub_id, start, __ pc());
     return start;
   }
 
-  // Dilithium pointwise multiply in the NTT domain.
-  // Implements static int implDilithiumNttMult(int[] product, int[] c1, int[] c2)
-  //   product[i] = montMul(c1[i], toMont(c2[i]))   where toMont(a) = montMul(a, R^2)
-  //
-  // product (int[256]) = c_rarg0
-  // c1      (int[256]) = c_rarg1
-  // c2      (int[256]) = c_rarg2
-  //
-  // Only three pointer arguments reach the stub: library_call.cpp reads a
-  // fourth "zetas" node but does not pass it, and the pointwise product needs
-  // no zetas of its own -- the product is purely pointwise.
+  // Pointwise multiplication in the NTT domain. The result is congruent to the
+  // Java Barrett-reduction result modulo q.
   address generate_dilithiumNttMult() {
-    __ align(CodeEntryAlignment);
     StubId stub_id = StubId::stubgen_dilithiumNttMult_id;
+    int entry_count = StubInfo::entry_count(stub_id);
+    assert(entry_count == 1, "sanity check");
+    address start = load_archive_data(stub_id);
+    if (start != nullptr) {
+      return start;
+    }
+    __ align(CodeEntryAlignment);
     StubCodeMark mark(this, stub_id);
-    address start = __ pc();
+    start = __ pc();
     __ enter();
 
     const Register product = c_rarg0;
@@ -8315,23 +8271,22 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ leave();
     __ ret();
 
+    store_archive_data(stub_id, start, __ pc());
     return start;
   }
 
-  // Dilithium multiply every coefficient by a runtime constant.
-  // Implements static int implDilithiumMontMulByConstant(int[] coeffs, int constant)
-  //
-  // coeffs   (int[256]) = c_rarg0, in place
-  // constant (int)      = c_rarg1
-  //
-  // The two constants actually passed in practice are MONT_R_MOD_Q (after the
-  // forward NTT) and MONT_DIM_INVERSE (after the inverse NTT), but the value
-  // is a runtime argument so it is broadcast rather than baked in.
+  // Multiply every coefficient by a runtime Montgomery constant.
   address generate_dilithiumMontMulByConstant() {
-    __ align(CodeEntryAlignment);
     StubId stub_id = StubId::stubgen_dilithiumMontMulByConstant_id;
+    int entry_count = StubInfo::entry_count(stub_id);
+    assert(entry_count == 1, "sanity check");
+    address start = load_archive_data(stub_id);
+    if (start != nullptr) {
+      return start;
+    }
+    __ align(CodeEntryAlignment);
     StubCodeMark mark(this, stub_id);
-    address start = __ pc();
+    start = __ pc();
     __ enter();
 
     const Register coeffs   = c_rarg0;
@@ -8367,33 +8322,22 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ leave();
     __ ret();
 
+    store_archive_data(stub_id, start, __ pc());
     return start;
   }
 
-  // Dilithium decompose each coefficient into (highPart, lowPart).
-  // Implements static int implDilithiumDecomposePoly(
-  //                  int[] input, int[] lowPart, int[] highPart,
-  //                  int twoGamma2, int multiplier)
-  //
-  // input      (int[256]) = c_rarg0
-  // lowPart    (int[256]) = c_rarg1
-  // highPart   (int[256]) = c_rarg2
-  // twoGamma2  (int)      = c_rarg3   190464 for ML-DSA-44, 523776 for 65/87
-  // multiplier (int)      = c_rarg4   22 for ML-DSA-44, 8 for 65/87
-  //
-  // gamma2 is not passed, so it is derived as twoGamma2 >> 1 (twoGamma2 is
-  // positive and even for both parameter sets).
-  //
-  // A straight transcription of decomposePolyJava.  The two conditional
-  // adjustments use masks that are 0 or -1, so they are plain ANDs -- no mask
-  // registers and no branches.  Note RVV has no vrsub.vv, so the
-  // "constant - vector" operands are written as vsub with the broadcast
-  // constant first.
+  // Decompose each coefficient into high and low parts without branches.
   address generate_dilithiumDecomposePoly() {
-    __ align(CodeEntryAlignment);
     StubId stub_id = StubId::stubgen_dilithiumDecomposePoly_id;
+    int entry_count = StubInfo::entry_count(stub_id);
+    assert(entry_count == 1, "sanity check");
+    address start = load_archive_data(stub_id);
+    if (start != nullptr) {
+      return start;
+    }
+    __ align(CodeEntryAlignment);
     StubCodeMark mark(this, stub_id);
-    address start = __ pc();
+    start = __ pc();
     __ enter();
 
     const Register input   = c_rarg0;
@@ -8419,7 +8363,7 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ li(t3, dilithium_q - 1);
     __ vmv_v_x(vqm1, t3);
     __ vmv_v_x(v2g, twoG2);
-    __ srli(gamma2, twoG2, 1);
+    __ srai(gamma2, twoG2, 1);
     __ vmv_v_x(vg, gamma2);
     __ li(remain, dilithium_n);
 
@@ -8485,6 +8429,7 @@ static const int64_t right_3_bits = right_n_bits(3);
     __ leave();
     __ ret();
 
+    store_archive_data(stub_id, start, __ pc());
     return start;
   }
 
