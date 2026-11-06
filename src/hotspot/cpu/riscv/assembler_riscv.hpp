@@ -2872,6 +2872,9 @@ enum Nf {
   // Vector Basic Bit-manipulation (Zvbb) Extension
   INSN(vcpop_v,  0b1010111, 0b010, 0b01110, 0b010010);
 
+  // Vector GHASH (Zvkg) Extension
+  INSN(vgmul_vv, 0b1110111, 0b010, 0b10001, 0b101000);
+
 #undef INSN
 
 #undef patch_VArith

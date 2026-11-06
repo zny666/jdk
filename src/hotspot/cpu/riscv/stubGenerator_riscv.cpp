@@ -3758,6 +3758,153 @@ class StubGenerator: public StubCodeGenerator {
   }
 
 
+  // VLEN=256 bulk path: four blocks in one m2 group.
+  void gcm_crypt_m2(Register in, Register input_len, Register ct, Register out,
+                    Register key, Register state, Register subkeyHtbl, Register counter) {
+    assert(MaxVectorSize == 32, "requires VLEN=256");
+    const Register keylen = x28;
+    const Register len = x29;
+    const Register counter_value = t0;
+    const Register scratch = x30;
+    const Register batch_bytes = x31;
+    const int BLOCK_SIZE = 16;
+    const int BATCH_BLOCKS = 4;
+    const int BATCH_BYTES = BATCH_BLOCKS * BLOCK_SIZE;
+    const int LANE_ELEMS = 4;
+    Label L_ret, L_tail, L_tail_loop, L_exit;
+
+    __ mv(len, input_len);
+    __ li(batch_bytes, BLOCK_SIZE);
+    __ bltu(len, batch_bytes, L_ret);
+    __ lwu(keylen, Address(key, arrayOopDesc::length_offset_in_bytes() - arrayOopDesc::base_offset_in_bytes(T_INT)));
+    VectorRegister rk[] = {
+      v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17, v18
+    };
+    aes_load_round_keys(key, keylen, rk);
+    __ vsetivli(x0, 2, Assembler::e64, Assembler::m1);
+    __ vle64_v(v19, subkeyHtbl);
+    __ vrev8_v(v19, v19);
+    __ vle64_v(v20, state);
+    __ vrev8_v(v20, v20);
+    __ vsetivli(x0, LANE_ELEMS, Assembler::e32, Assembler::m1);
+    __ lwu(counter_value, Address(counter, 12));
+    __ rev8(counter_value, counter_value);
+    __ srli(counter_value, counter_value, 32);
+    __ li(batch_bytes, BATCH_BYTES);
+    __ bltu(len, batch_bytes, L_tail);
+
+    __ vmv1r_v(v26, v19);
+    __ vgmul_vv(v26, v19);
+    __ vmv1r_v(v24, v26);
+    __ vgmul_vv(v24, v19);
+    __ vmv1r_v(v28, v26);
+    __ vgmul_vv(v28, v26);
+    __ vmv1r_v(v0, v19);
+    __ vsetivli(x0, BATCH_BLOCKS * LANE_ELEMS, Assembler::e32, Assembler::m2);
+    __ vmv1r_v(v2, v28);
+    __ vslideup_vi(v2, v24, LANE_ELEMS);
+    __ vslideup_vi(v2, v26, 2 * LANE_ELEMS);
+    __ vslideup_vi(v2, v0, 3 * LANE_ELEMS);
+    __ vmv1r_v(v30, v28);
+    __ vslideup_vi(v30, v28, LANE_ELEMS);
+    __ vslideup_vi(v30, v28, 2 * LANE_ELEMS);
+    __ vslideup_vi(v30, v28, 3 * LANE_ELEMS);
+    __ vmv1r_v(v22, v20);
+    __ vxor_vv(v26, v26, v26);
+    __ vslideup_vi(v22, v26, LANE_ELEMS);
+
+    __ subi(sp, sp, 2 * BATCH_BYTES);
+    __ li(scratch, BATCH_BLOCKS);
+    for (int i = 0; i < BATCH_BLOCKS; i++) {
+      __ sd(x0, Address(sp, BATCH_BYTES + i * BLOCK_SIZE));
+      __ sw(x0, Address(sp, BATCH_BYTES + i * BLOCK_SIZE + 8));
+      __ sw(scratch, Address(sp, BATCH_BYTES + i * BLOCK_SIZE + 12));
+    }
+    for (int i = 0; i < BATCH_BLOCKS; i++) {
+      __ ld(scratch, Address(counter));
+      __ sd(scratch, Address(sp, i * BLOCK_SIZE));
+      __ lwu(scratch, Address(counter, 8));
+      __ sw(scratch, Address(sp, i * BLOCK_SIZE + 8));
+      __ slli(scratch, counter_value, 32);
+      __ rev8(scratch, scratch);
+      __ sw(scratch, Address(sp, i * BLOCK_SIZE + 12));
+      __ addi(counter_value, counter_value, 1);
+    }
+    __ vle32_v(v0, sp);
+    __ vrev8_v(v0, v0);
+    __ addi(t1, sp, BATCH_BYTES);
+    __ vle32_v(v28, t1);
+    __ addi(sp, sp, 2 * BATCH_BYTES);
+
+    Label L_bulk, L_hash;
+    __ bind(L_bulk);
+    __ vmv2r_v(v24, v0);
+    __ vrev8_v(v24, v24);
+    __ vadd_vv(v0, v0, v28);
+    aes_encrypt_all(v24, keylen, rk);
+    // Preserve decrypt input across the output store; ct identifies the caller's direction.
+    __ vle32_v(v26, in);
+    __ vxor_vv(v24, v24, v26);
+    __ vse32_v(v24, out);
+    __ beq(ct, out, L_hash);
+    __ vmv2r_v(v24, v26);
+    __ bind(L_hash);
+    // A = A*H^4 ^ D*[H^4,H^3,H^2,H]; fold only at bulk exit.
+    __ vgmul_vv(v22, v30);
+    __ vgmul_vv(v24, v2);
+    __ vxor_vv(v22, v22, v24);
+    __ addi(in, in, BATCH_BYTES);
+    __ addi(out, out, BATCH_BYTES);
+    __ addi(ct, ct, BATCH_BYTES);
+    __ subi(len, len, BATCH_BYTES);
+    __ bgeu(len, batch_bytes, L_bulk);
+
+    __ vslidedown_vi(v24, v0, 3);
+    __ vmv_x_s(counter_value, v24);
+    __ vslidedown_vi(v24, v22, 2 * LANE_ELEMS);
+    __ vxor_vv(v22, v22, v24);
+    __ vslidedown_vi(v24, v22, LANE_ELEMS);
+    __ vxor_vv(v22, v22, v24);
+    __ vmv1r_v(v20, v22);
+
+    __ bind(L_tail);
+    __ vsetivli(x0, LANE_ELEMS, Assembler::e32, Assembler::m1);
+    __ li(batch_bytes, BLOCK_SIZE);
+    __ bltu(len, batch_bytes, L_exit);
+    __ bind(L_tail_loop);
+    __ slli(scratch, counter_value, 32);
+    __ rev8(scratch, scratch);
+    __ sw(scratch, Address(counter, 12));
+    __ vle32_v(v24, counter);
+    aes_encrypt_all(v24, keylen, rk);
+    __ vle32_v(v26, in);
+    __ vxor_vv(v24, v24, v26);
+    __ vse32_v(v24, out);
+    Label L_tail_hash;
+    __ beq(ct, out, L_tail_hash);
+    __ vmv1r_v(v24, v26);
+    __ bind(L_tail_hash);
+    __ vghsh_vv(v20, v19, v24);
+    __ addi(counter_value, counter_value, 1);
+    __ addi(in, in, BLOCK_SIZE);
+    __ addi(out, out, BLOCK_SIZE);
+    __ addi(ct, ct, BLOCK_SIZE);
+    __ subi(len, len, BLOCK_SIZE);
+    __ bgeu(len, batch_bytes, L_tail_loop);
+
+    __ bind(L_exit);
+    __ slli(scratch, counter_value, 32);
+    __ rev8(scratch, scratch);
+    __ sw(scratch, Address(counter, 12));
+    __ vsetivli(x0, 2, Assembler::e64, Assembler::m1);
+    __ vrev8_v(v20, v20);
+    __ vse64_v(v20, state);
+    __ bind(L_ret);
+    __ sub(c_rarg0, input_len, len);
+    __ leave();
+    __ ret();
+  }
+
   // Vector AES Galois Counter Mode implementation. Parameters:
   //
   // in = c_rarg0
@@ -3806,6 +3953,12 @@ class StubGenerator: public StubCodeGenerator {
 
     start = __ pc();
     __ enter();
+
+    if (MaxVectorSize == 32) {
+      gcm_crypt_m2(in, input_len, ct, out, key, state, subkeyHtbl, counter);
+      store_archive_data(stub_id, start, __ pc());
+      return start;
+    }
 
     Label L_exit;
     // Requires input_len (512) bytes to efficiently use the intrinsic
